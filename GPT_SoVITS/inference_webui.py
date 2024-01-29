@@ -378,6 +378,124 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         np.int16
     )
 
+
+# region My TTS
+import soundfile as sf
+
+
+def get_ht_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, filepath):
+    t0 = ttime()
+    prompt_text = prompt_text.strip("\n")
+    if (prompt_text[-1] not in splits): prompt_text += "。" if prompt_text != "en" else "."
+    text = text.strip("\n")
+    if (len(get_first(text)) < 4): text += "。" if text != "en" else "."
+    zero_wav = np.zeros(
+        int(hps.data.sampling_rate * 0.3),
+        dtype=np.float16 if is_half == True else np.float32,
+    )
+    with torch.no_grad():
+        wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+        if (wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000):
+            raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
+        wav16k = torch.from_numpy(wav16k)
+        zero_wav_torch = torch.from_numpy(zero_wav)
+        if is_half == True:
+            wav16k = wav16k.half().to(device)
+            zero_wav_torch = zero_wav_torch.half().to(device)
+        else:
+            wav16k = wav16k.to(device)
+            zero_wav_torch = zero_wav_torch.to(device)
+        wav16k = torch.cat([wav16k, zero_wav_torch])
+        ssl_content = ssl_model.model(wav16k.unsqueeze(0))[
+            "last_hidden_state"
+        ].transpose(
+            1, 2
+        )  # .float()
+        codes = vq_model.extract_latent(ssl_content)
+        prompt_semantic = codes[0, 0]
+    t1 = ttime()
+    prompt_language = dict_language[prompt_language]
+    text_language = dict_language[text_language]
+
+    if prompt_language == "en":
+        phones1, word2ph1, norm_text1 = clean_text_inf(prompt_text, prompt_language)
+    else:
+        phones1, word2ph1, norm_text1 = nonen_clean_text_inf(prompt_text, prompt_language)
+
+    text = text.replace("\n\n", "\n").replace("\n\n", "\n").replace("\n\n", "\n")
+    if (text[-1] not in splits): text += "。" if text_language != "en" else "."
+    texts = text.split("\n")
+    audio_opt = []
+    if prompt_language == "en":
+        bert1 = get_bert_inf(phones1, word2ph1, norm_text1, prompt_language)
+    else:
+        bert1 = nonen_get_bert_inf(prompt_text, prompt_language)
+
+    for text in texts:
+        # 解决输入目标文本的空行导致报错的问题
+        if (len(text.strip()) == 0):
+            continue
+        if text_language == "en":
+            phones2, word2ph2, norm_text2 = clean_text_inf(text, text_language)
+        else:
+            phones2, word2ph2, norm_text2 = nonen_clean_text_inf(text, text_language)
+
+        if text_language == "en":
+            bert2 = get_bert_inf(phones2, word2ph2, norm_text2, text_language)
+        else:
+            bert2 = nonen_get_bert_inf(text, text_language)
+
+        bert = torch.cat([bert1, bert2], 1)
+
+        all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(device).unsqueeze(0)
+        bert = bert.to(device).unsqueeze(0)
+        all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
+        prompt = prompt_semantic.unsqueeze(0).to(device)
+        t2 = ttime()
+        with torch.no_grad():
+            # pred_semantic = t2s_model.model.infer(
+            pred_semantic, idx = t2s_model.model.infer_panel(
+                all_phoneme_ids,
+                all_phoneme_len,
+                prompt,
+                bert,
+                # prompt_phone_len=ph_offset,
+                top_k=config["inference"]["top_k"],
+                early_stop_num=hz * max_sec,
+            )
+        t3 = ttime()
+        # print(pred_semantic.shape,idx)
+        pred_semantic = pred_semantic[:, -idx:].unsqueeze(
+            0
+        )  # .unsqueeze(0)#mq要多unsqueeze一次
+        refer = get_spepc(hps, ref_wav_path)  # .to(device)
+        if is_half == True:
+            refer = refer.half().to(device)
+        else:
+            refer = refer.to(device)
+        # audio = vq_model.decode(pred_semantic, all_phoneme_ids, refer).detach().cpu().numpy()[0, 0]
+        audio = (
+            vq_model.decode(
+                pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refer
+            )
+            .detach()
+            .cpu()
+            .numpy()[0, 0]
+        )  ###试试重建不带上prompt部分
+        audio_opt.append(audio)
+        audio_opt.append(zero_wav)
+        t4 = ttime()
+
+    audio_data = (np.concatenate(audio_opt, 0)).astype(
+        np.float64
+    )
+    sf.write(filepath, audio_data, 32000)
+    print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t3 - t2, t4 - t3))
+    return f'Render text: {prompt_text}'
+
+
+# endregion
+
 def split(todo_text):
     todo_text = todo_text.replace("……", "。").replace("——", "，")
     if todo_text[-1] not in splits:
@@ -523,6 +641,111 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
             button3.click(cut3, [text_inp], [text_opt])
             button4.click(cut4, [text_inp], [text_opt])
         gr.Markdown(value=i18n("后续将支持混合语种编码文本输入。"))
+
+    # region HT Vo Ext
+
+    gr.Markdown('''---
+    # HT Voice Ext
+    ---''')
+    HT_VO_DIR = '../HT-VoDatabase'
+    HT_SPEAKERS = {}
+    import pandas as pd
+    import random
+
+
+    def init_ht_vo_data(vo_dir):
+        if not os.path.isdir(vo_dir):
+            os.environ['ht_vo_dir'] = ''
+            os.environ['ht_vo_speaker_csv'] = ''
+            os.environ['ht_vo_out_list'] = ''
+            os.environ['ht_vo_wav_dir'] = ''
+            return
+        os.environ['ht_vo_dir'] = vo_dir
+        os.environ['ht_vo_speaker_csv'] = vo_dir + '/id_name.csv'
+        os.environ['ht_vo_out_list'] = vo_dir + '/multi_out.list'
+        os.environ['ht_vo_wav_dir'] = vo_dir + '/slicer_opt'
+        data = pd.read_csv(os.environ['ht_vo_speaker_csv'])
+        for idx, row in data.iterrows():
+            try:
+                HT_SPEAKERS[row[1]] = row[0]
+            except Exception as e:
+                print(e)
+
+
+    init_ht_vo_data(HT_VO_DIR)
+
+    with gr.Row():
+        ht_vo_dir = gr.Textbox(value=HT_VO_DIR, label='语音文件夹')
+        ht_vo_load_btn = gr.Button('加载音色', variant='primary')
+        ht_vo_speaker = gr.Dropdown(choices=sorted(HT_SPEAKERS.keys()), label='选择角色')
+        ht_random_btn = gr.Button('随机选择参考音频', variant='primary')
+    gr.Markdown('---')
+    with gr.Row():
+        ht_xl_file = gr.File(label='语音需求表', file_count='single')
+        ht_vo_out_dir = gr.Textbox('ht_vo_out', label='输出文件夹')
+        ht_run_btn = gr.Button('开始批量处理', variant='primary')
+    ht_vo_msg = gr.Textbox(label='Message')
+
+
+    def load_ht_vo_data(vo_dir):
+        init_ht_vo_data(vo_dir)
+        yield gr.Dropdown.update(choices=sorted(HT_SPEAKERS.keys()))
+
+
+    def get_one_ref(speaker_name):
+        result = [gr.Audio.update(), gr.Textbox()]
+        if not speaker_name in HT_SPEAKERS:
+            return result
+        speaker_id = HT_SPEAKERS[speaker_name]
+        list_file = os.environ['ht_vo_out_list']
+        if not list_file:
+            return result
+
+        print(os.environ['ht_vo_out_list'], '======================')
+
+        with open(list_file, 'r', encoding='utf-8') as f:
+            ls = re.findall(f'.+(HT-VoDatabase\\\\.+?)\|{speaker_id}\|ZH\|(.+)', f.read())
+            if not ls:
+                return result
+            row = random.choice(ls)
+            wav_path = '..\\' + row[0]
+            text = row[1]
+            return [gr.Audio.update(value=wav_path), text]
+
+
+    def ht_tts(ref_wav_path, prompt_text, xl_file, out_dir):
+        xl_file = xl_file.name
+        if not os.path.isfile(xl_file):
+            return '找不到需求表！路径错误！'
+        if not out_dir:
+            return '没有指定输出文件夹！'
+        if not ref_wav_path:
+            return '请选择参考音频！'
+        if not prompt_text:
+            return '请输入参考音频对应的文本！'
+
+        data = pd.read_excel(xl_file).to_dict('records')
+        os.makedirs(out_dir, exist_ok=True)
+        for i in data:
+            if not ('text' in i and 'filename' in i): continue
+            text = str(i['text']).strip()
+            filename = str(i['filename']).strip()
+            if not filename.endswith('.wav'):
+                filename += '.wav'
+            filepath = out_dir + '/' + filename
+
+            yield get_ht_tts_wav(ref_wav_path, prompt_text, '中文', text, '中文', filepath)
+
+
+    ht_vo_load_btn.click(load_ht_vo_data, ht_vo_dir, ht_vo_speaker)
+    ht_random_btn.click(get_one_ref, ht_vo_speaker, [inp_ref, prompt_text])
+    ht_run_btn.click(
+        ht_tts,
+        [inp_ref, prompt_text, ht_xl_file, ht_vo_out_dir],
+        [ht_vo_msg],
+    )
+
+    # endregion HT Voice Ext
 
 app.queue(concurrency_count=511, max_size=1022).launch(
     server_name="0.0.0.0",
